@@ -49,6 +49,9 @@ class xFuserFluxTransformer2DWrapper(xFuserTransformerBaseWrapper):
             None for _ in range(len(self.transformer_blocks))
         ]
 
+    def reset_caches(self):
+        pass
+
     def forward(
         self,
         hidden_states: torch.Tensor,

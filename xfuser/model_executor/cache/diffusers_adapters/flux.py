@@ -68,7 +68,15 @@ def apply_cache_on_transformer(
                 **kwargs,
             )
 
+    original_reset_caches = transformer.reset_caches
+
+    @functools.wraps(original_reset_caches)
+    def new_reset_caches(self):
+        for transformer_block in cached_transformer_blocks:
+            transformer_block.reset_caches()
+
     transformer.forward = new_forward.__get__(transformer)
+    transformer.reset_caches = new_reset_caches.__get__(transformer)
 
     return transformer
 

@@ -179,6 +179,12 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
 
         super().__init__(module=pipeline)
 
+    def reset_transformer_cache(self):
+        if hasattr(self.module, "transformer") and hasattr(
+            self.module.transformer, "reset_caches"
+        ):
+            self.module.transformer.reset_caches()
+
     def reset_activation_cache(self):
         if hasattr(self.module, "transformer") and hasattr(
             self.module.transformer, "reset_activation_cache"

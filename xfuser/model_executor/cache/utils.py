@@ -30,6 +30,14 @@ class CacheContext(Module):
     def get_coef(self, name: str) -> torch.Tensor:
         return getattr(self, f"{name}_coef")
 
+    def reset(self):
+        self.original_hidden_states = None
+        self.original_encoder_hidden_states = None
+        self.hidden_states_residual = None
+        self.encoder_hidden_states_residual = None
+        self.modulated_inputs = None
+
+
 #---------  CacheCallback  ---------#
 @dataclasses.dataclass
 class CacheState:
@@ -106,6 +114,9 @@ class CachedTransformerBlocks(torch.nn.Module, ABC):
     @property
     def is_parallelized(self) -> bool:
         return get_sequence_parallel_world_size() > 1
+
+    def reset_caches(self):
+        self.cache_context.reset()
 
     def all_reduce(self, input_: torch.Tensor, op=torch.distributed.ReduceOp.AVG) -> torch.Tensor:
         return get_sp_group().all_reduce(input_, op=op) if self.is_parallelized else input_
