@@ -3,6 +3,7 @@ import time
 import datetime
 import argparse
 import os
+import io
 import random
 import torch
 import torch.distributed
@@ -31,14 +32,24 @@ WORKER_JOB_TYPE = "flux_dev"
 DEFAULT_WORKER_AUTH_KEY = "2a14da16a70713bb3a4484b4ae5f681f"
 VERSION = 2
 
-
 class Inferencer():
+    """
+    The Inferencer class is responsible for loading models and generating images
+    using the loaded models. It handles the configuration of the model pipeline
+    and manages the inference process.
+    """
 
     engine_args = None
     engine_config = None
 
     def __init__(self, ckpt_dir: str, world_size:int):
+        """
+        Initialize the Inferencer with the given checkpoint directory and world size.
 
+        Args:
+            ckpt_dir (str): Directory containing the model checkpoint.
+            world_size (int): The number of processes participating in the distributed training.
+        """
         self.engine_args = xFuserArgs(ckpt_dir)
 
         # pipefusion parallel
@@ -56,6 +67,7 @@ class Inferencer():
         self.engine_args.use_parallel_vae = False
         self.engine_args.use_fp8_t5_encode = True
         self.engine_args.use_torch_compile = False
+        self.engine_args.max_sequence_length = 512
 
         self.engine_config, self.input_config = self.engine_args.create_config()
         self.engine_config.runtime_config.dtype = torch.bfloat16
@@ -63,9 +75,11 @@ class Inferencer():
         self.text_encoder_2 = None
         self.pipe = None
 
-
     def load_models(self):
-
+        """
+        Load the models required for image generation. This includes loading
+        the text encoder and setting up the pipeline for inference.
+        """
         self.text_encoder_2 = T5EncoderModel.from_pretrained(self.engine_config.model_config.model, subfolder="text_encoder_2", torch_dtype=torch.bfloat16)
 
         if self.engine_args.use_fp8_t5_encoder:
@@ -96,6 +110,24 @@ class Inferencer():
 
 
     def gen_image(self, prompt, callback, width, height, num_steps, seed, guidance, progress_images=False, init_image=None, image2image_strength=0.8):
+        """
+        Generate an image based on the given prompt and parameters.
+
+        Args:
+            prompt (str): The text prompt used to generate the image.
+            callback (function): The callback function to process the output image.
+            width (int): The width of the generated image.
+            height (int): The height of the generated image.
+            num_steps (int): The number of inference steps to perform.
+            seed (int): The random seed for reproducibility.
+            guidance (float): The guidance scale for the image generation.
+            progress_images (bool, optional): Whether to provide progress images. Defaults to False.
+            init_image (PIL.Image, optional): The initial image for image-to-image generation. Defaults to None.
+            image2image_strength (float, optional): The strength for image-to-image generation. Defaults to 0.8.
+
+        Returns:
+            PIL.Image: The generated image.
+        """
         torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
 
@@ -108,6 +140,11 @@ class Inferencer():
         self.pipe.reset_activation_cache()
         self.pipe.reset_transformer_cache()
 
+        def pipe_callback_on_step_end(pipeline, step: int, timestep: int, callback_kwargs):
+            if self.local_rank == 0:
+                callback(None, 1 + ((num_steps - 2) * step) / num_steps, False, message='Denoising...')
+            return callback_kwargs
+
         output = self.pipe(
             height=height,
             width=width,
@@ -117,6 +154,7 @@ class Inferencer():
             max_sequence_length=256,
             guidance_scale=guidance,
             generator=torch.Generator(device="cuda").manual_seed(seed),
+            callback_on_step_end=pipe_callback_on_step_end
         )
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -124,7 +162,7 @@ class Inferencer():
 
         dp_group_index = get_data_parallel_rank()
         num_dp_groups = get_data_parallel_world_size()
-        dp_batch_size = (self.input_config.batch_size + num_dp_groups - 1) // num_dp_groups        
+        dp_batch_size = (self.input_config.batch_size + num_dp_groups - 1) // num_dp_groups
 
         last_rank = get_world_group().world_size - 1
 
@@ -135,7 +173,7 @@ class Inferencer():
                 images.append(image)
         else:
             images.append(Image.new("RGB", (width, height), (255, 255, 255)))
-        
+
         torch.distributed.broadcast_object_list(images, last_rank)
 
         if(self.local_rank == 0):
@@ -144,9 +182,22 @@ class Inferencer():
                 f"epoch time: {elapsed_time:.2f} sec, peak GPU memory: {peak_memory/1e9:.2f} GB"
             )
 
-
 class ProcessOutputCallback():
+    """
+    The ProcessOutputCallback class is responsible for processing the output
+    of the image generation and sending the results back to the API worker.
+    It handles progress updates and final results.
+    """
+
     def __init__(self, api_worker, inferencer, model_name):
+        """
+        Initialize the ProcessOutputCallback with the given API worker, inferencer, and model name.
+
+        Args:
+            api_worker (APIWorkerInterface): The API worker interface to send results.
+            inferencer (Inferencer): The inferencer instance used for image generation.
+            model_name (str): The name of the model used for inference.
+        """
         self.api_worker = api_worker
         self.inferencer = inferencer
         self.model_name = model_name
@@ -156,13 +207,23 @@ class ProcessOutputCallback():
         self.preprocessing_duration = None
 
     def process_output(self, image, progress_step=100, finished=True, error=None, message=None):
+        """
+        Process the output image and send the results to the API worker.
+
+        Args:
+            image (PIL.Image): The generated image.
+            progress_step (int, optional): The current progress step. Defaults to 100.
+            finished (bool, optional): Whether the generation is finished. Defaults to True.
+            error (str, optional): Error message if any. Defaults to None.
+            message (str, optional): Additional message to include in the progress. Defaults to None.
+        """
         if error:
             print('error')
             self.api_worker.send_progress(100, None)
             image = Image.fromarray((np.random.rand(1024,1024,3) * 255).astype(np.uint8))
             return self.api_worker.send_job_results({
-                'images': [image], 
-                'error': error, 
+                'images': [image],
+                'error': error,
                 'model_name': self.model_name
             })
         else:
@@ -174,7 +235,7 @@ class ProcessOutputCallback():
                 if self.api_worker.progress_data_received:
                     progress_data = {'progress_message': message}
                     if image is not None:
-                        progress_data['progress_images'] = [image]                       
+                        progress_data['progress_images'] = [image]
                     return self.api_worker.send_progress(progress_info, progress_data)
             else:
                 self.finished_time = time.time()
@@ -182,7 +243,7 @@ class ProcessOutputCallback():
                 image_list = [image]
                 self.api_worker.send_progress(100, None)
                 return self.api_worker.send_job_results({
-                    'images': image_list, 
+                    'images': image_list,
                     'seed': self.job_data.get('seed'),
                     'model_name': self.model_name,
                     "finished_time": self.finished_time,
@@ -194,8 +255,13 @@ class ProcessOutputCallback():
                     }
                 })
 
-
 def load_flags():
+    """
+    Load command-line arguments using argparse.
+
+    Returns:
+        argparse.Namespace: The parsed command-line arguments.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--api_server", type=str, default="http://0.0.0.0:7777", help="Address of the AIME API server"
@@ -207,20 +273,40 @@ def load_flags():
         "--ckpt_dir", type=str, default="/models/FLUX.1-dev/", help="Destination of model weigths"
                         )
     parser.add_argument(
-        "--api_auth_key", type=str , default=DEFAULT_WORKER_AUTH_KEY, required=False, 
+        "--api_auth_key", type=str , default=DEFAULT_WORKER_AUTH_KEY, required=False,
         help="API server worker auth key",
     )
     return parser.parse_args()
 
+def convert_binary_to_image(image_data, width, height):
+    """
+    Convert binary image data to a PIL Image object and resize it.
+
+    Args:
+        image_data (bytes): The binary image data.
+        width (int): The desired width of the image.
+        height (int): The desired height of the image.
+
+    Returns:
+        PIL.Image: The resized image.
+    """
+    if image_data:
+        with io.BytesIO(image_data) as buffer:
+            image = Image.open(buffer)
+            return image.resize((width, height), Image.LANCZOS)
 
 @torch.no_grad()
 def main():
+    """
+    The main function that sets up the API worker, loads models, and processes jobs.
+    This is the entry point for the worker process.
+    """
     args = load_flags()
     device = "cuda:" + str(args.gpu_id)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    
+
     # torch.set_default_device(device)
     api_worker = APIWorkerInterface(
         args.api_server, WORKER_JOB_TYPE, args.api_auth_key, args.gpu_id,
@@ -241,52 +327,57 @@ def main():
             callback.arrival_time = time.time()
 
             job_data = api_worker.job_batch_request(1)
+
+            init_image = None
+
             if local_rank == 0:
                 job_data = job_data[0]
                 print(f'Processing job {job_data.get("job_id")}...', end='', flush=True)
-            
+
                 preprocessing_start = time.time()
-            
+
                 seed = job_data.get('seed', -1)
                 if seed == -1:
                     random.seed(datetime.datetime.now().timestamp())
                     seed = random.randint(1, 99999999)
+                    job_data['seed'] = seed
 
                 seed = [seed]
                 init_image = api_worker.get_binary(job_data, 'image')
                 if init_image:
-                    init_image = convert_binary_to_image(
+                    init_image = [convert_binary_to_image(
                         init_image,
-                        job_data.get('width'), 
+                        job_data.get('width'),
                         job_data.get('height')
-                    )
-                else:
-                    init_image = []
+                    )]
+
                 callback.job_data = job_data
 
                 callback.preprocessing_duration = time.time() - preprocessing_start
                 prompt = [job_data.get('prompt')]
                 width = [job_data.get('width')]
-                height = [job_data.get('height')] 
+                height = [job_data.get('height')]
                 steps = [job_data.get('steps')]
                 guidance = [job_data.get('guidance')]
                 progress_images = [job_data.get('provide_progress_images') == "decoded"]
                 image2image_strength = [job_data.get('image2image_strength')]
             else:
                 seed = [0]
-                init_image = None
                 callback.job_data = job_data
                 prompt = [""]
                 width = [1024]
-                height = [1024] 
+                height = [1024]
                 steps = [0]
                 guidance = [1.0]
                 progress_images = [False]
                 image2image_strength = [0.0]
 
+            if not init_image:
+                init_image = [Image.new("RGB", (0, 0))]
+
             torch.distributed.broadcast_object_list(prompt, 0)
             torch.distributed.broadcast_object_list(seed, 0)
-#            torch.distributed.broadcast_object_list(init_image, 0)
+            torch.distributed.broadcast_object_list(init_image, 0)
             torch.distributed.broadcast_object_list(width, 0)
             torch.distributed.broadcast_object_list(height, 0)
             torch.distributed.broadcast_object_list(steps, 0)
@@ -294,13 +385,12 @@ def main():
             torch.distributed.broadcast_object_list(progress_images, 0)
             torch.distributed.broadcast_object_list(image2image_strength, 0)
 
-            print("SEED:" + str(seed))
             image = inferencer.gen_image(
                 prompt[0],
                 callback.process_output,
-                width[0], 
-                height[0], 
-                steps[0], 
+                width[0],
+                height[0],
+                steps[0],
                 seed[0],
                 guidance[0],
                 progress_images[0],
@@ -310,10 +400,10 @@ def main():
 
             print('Done')
 
-#        except ValueError as exc:
-#            print('Error')
-#            callback.process_output(None, None, True, f'{exc}\nChange parameters and try again')
-#            continue
+        except ValueError as exc:
+            print('Error')
+            callback.process_output(None, None, True, f'{exc}\nChange parameters and try again')
+            continue
         except torch.cuda.OutOfMemoryError as exc:
             print('Error - CUDA OOM')
             callback.process_output(None, None, True, f'{exc}\nReduce image size and try again')
@@ -322,7 +412,7 @@ def main():
             print('Error')
             callback.process_output(None, None, True, f'{exc}\nInvalid image file')
             continue
-    
+
     get_runtime_state().destroy_distributed_env()
 
 if __name__ == "__main__":
