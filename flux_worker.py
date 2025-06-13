@@ -4,9 +4,11 @@ import datetime
 import argparse
 import os
 import io
+import math
 import random
 import torch
 import torch.distributed
+from torch import Tensor
 from transformers import T5EncoderModel
 from xfuser import xFuserFluxPipeline, xFuserArgs
 from xfuser.config import FlexibleArgumentParser
@@ -21,7 +23,7 @@ from xfuser.core.distributed import (
     get_tensor_model_parallel_world_size,
     get_data_parallel_world_size,
 )
-from xfuser.model_executor.cache.diffusers_adapters import apply_cache_on_transformer
+from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate_shift
 
 from PIL import Image
 import numpy as np
@@ -67,7 +69,6 @@ class Inferencer():
         self.engine_args.use_parallel_vae = False
         self.engine_args.use_fp8_t5_encode = True
         self.engine_args.use_torch_compile = False
-        self.engine_args.max_sequence_length = 512
 
         self.engine_config, self.input_config = self.engine_args.create_config()
         self.engine_config.runtime_config.dtype = torch.bfloat16
@@ -108,6 +109,47 @@ class Inferencer():
 
         self.pipe.prepare_run(self.input_config, steps=1)
 
+    def gen_noise(
+        self,
+        num_samples: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        seed: int,
+    ):
+        return torch.randn(
+            num_samples,
+            16,
+            # allow for packing
+            2 * math.ceil(height / 16),
+            2 * math.ceil(width / 16),
+            device=device,
+            dtype=dtype,
+            generator=torch.Generator(device=device).manual_seed(seed),
+        )
+
+
+    def precalc_timesteps(self, latents, num_inference_steps):
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        image_seq_len = latents.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.pipe.scheduler.config.base_image_seq_len,
+            self.pipe.scheduler.config.max_image_seq_len,
+            self.pipe.scheduler.config.base_shift,
+            self.pipe.scheduler.config.max_shift,
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.pipe.scheduler,
+            num_inference_steps,
+            device=None,
+            timesteps=None,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        return timesteps
+
 
     def gen_image(self, prompt, callback, width, height, num_steps, seed, guidance, progress_images=False, init_image=None, image2image_strength=0.8):
         """
@@ -145,15 +187,59 @@ class Inferencer():
                 callback(None, 1 + ((num_steps - 2) * step) / num_steps, False, message='Denoising...')
             return callback_kwargs
 
+        latents = None
+        generator = None
+
+        noise_latents = self.gen_noise(
+               1,
+               height,
+               width,
+               device=None,
+               dtype=torch.float,
+               seed=seed
+        ).cuda()
+
+        timestep_offset = 0
+
+        if init_image: 
+            init_image = init_image.convert("RGB")
+            init_image = np.array(init_image).astype(np.float32)
+            init_image = torch.from_numpy(init_image).permute(2, 0, 1).float() / 128.0
+            init_image = init_image - 1.0; 
+            init_image = init_image.unsqueeze(0) 
+            init_image = torch.nn.functional.interpolate(init_image, (height, width))
+            latents = self.pipe.vae.encode(init_image.bfloat16().cuda())["latent_dist"].sample() 
+            latents = latents - self.pipe.vae.config.shift_factor
+            latents = latents * self.pipe.vae.config.scaling_factor  
+
+            vae_height = 2 * (int(height) // (self.pipe.vae_scale_factor * 2))
+            vae_width = 2 * (int(width) // (self.pipe.vae_scale_factor * 2))            
+
+            platents = self.pipe._pack_latents(latents.bfloat16(), 1, 16, vae_height, vae_width)
+            
+            timesteps = self.precalc_timesteps(platents, num_steps)
+
+            timestep_offset = int((1 - image2image_strength) * num_steps)
+            t = timesteps[timestep_offset] * 0.001
+            latents = t * noise_latents + (1.0 - t) * latents.float()
+
+            latents = self.pipe._pack_latents(latents.bfloat16(), 1, 16, vae_height, vae_width)
+        else:
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+
         output = self.pipe(
             height=height,
             width=width,
             prompt=prompt,
+            num_warmup_steps=1,
             num_inference_steps=num_steps,
             output_type="pil",
-            max_sequence_length=256,
+            max_sequence_length=512,
             guidance_scale=guidance,
-            generator=torch.Generator(device="cuda").manual_seed(seed),
+            generator=generator,
+            latents=latents,
+            timesteps = None,
+            timestep_offset=timestep_offset,
             callback_on_step_end=pipe_callback_on_step_end
         )
         end_time = time.time()
@@ -328,7 +414,7 @@ def main():
 
             job_data = api_worker.job_batch_request(1)
 
-            init_image = None
+            init_image = [None]
 
             if local_rank == 0:
                 job_data = job_data[0]
@@ -343,10 +429,10 @@ def main():
                     job_data['seed'] = seed
 
                 seed = [seed]
-                init_image = api_worker.get_binary(job_data, 'image')
-                if init_image:
+                init_image_data = api_worker.get_binary(job_data, 'image')
+                if init_image_data:
                     init_image = [convert_binary_to_image(
-                        init_image,
+                        init_image_data,
                         job_data.get('width'),
                         job_data.get('height')
                     )]
@@ -372,12 +458,12 @@ def main():
                 progress_images = [False]
                 image2image_strength = [0.0]
 
-            if not init_image:
-                init_image = [Image.new("RGB", (0, 0))]
-
             torch.distributed.broadcast_object_list(prompt, 0)
             torch.distributed.broadcast_object_list(seed, 0)
-            torch.distributed.broadcast_object_list(init_image, 0)
+            has_init_image = [init_image[0] != None]
+            torch.distributed.broadcast_object_list(has_init_image, 0)
+            if has_init_image[0]:
+                torch.distributed.broadcast_object_list(init_image, 0)
             torch.distributed.broadcast_object_list(width, 0)
             torch.distributed.broadcast_object_list(height, 0)
             torch.distributed.broadcast_object_list(steps, 0)
@@ -394,7 +480,7 @@ def main():
                 seed[0],
                 guidance[0],
                 progress_images[0],
-                init_image,
+                init_image[0],
                 image2image_strength[0]
             )
 
