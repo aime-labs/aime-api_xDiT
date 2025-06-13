@@ -114,6 +114,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         width: Optional[int] = None,
         num_inference_steps: int = 28,
         timesteps: List[int] = None,
+        timestep_offset: int = 0,
         guidance_scale: float = 3.5,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -197,7 +198,6 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
             images.
         """
-
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
@@ -272,7 +272,9 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         )
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        sigmas = None
+        if timesteps == None:
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
@@ -289,6 +291,12 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             sigmas,
             mu=mu,
         )
+        
+        # image2image hack
+        if timestep_offset > 0:
+            timesteps = timesteps[timestep_offset:]
+            num_inference_steps = len(timesteps)
+
         num_warmup_steps = max(
             len(timesteps) - num_inference_steps * self.scheduler.order, 0
         )
@@ -310,7 +318,6 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                 get_pipeline_parallel_world_size() > 1
                 and len(timesteps) > num_pipeline_warmup_steps
             ):
-                # raise RuntimeError("Async pipeline not supported in flux")
                 latents = self._sync_pipeline(
                     latents=latents,
                     prompt_embeds=prompt_embeds,
@@ -773,7 +780,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-        ret = self.transformer(
+        noise_pred, encoder_hidden_states = self.transformer(
             hidden_states=latents,
             timestep=timestep / 1000,
             guidance=guidance,
@@ -784,10 +791,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             joint_attention_kwargs=self.joint_attention_kwargs,
             return_dict=False,
         )[0]
-        if self.engine_config.parallel_config.dit_parallel_size > 1:
-            noise_pred, encoder_hidden_states = ret
-        else:
-            noise_pred, encoder_hidden_states = ret, None
+
         return noise_pred, encoder_hidden_states
 
     def _scheduler_step(
