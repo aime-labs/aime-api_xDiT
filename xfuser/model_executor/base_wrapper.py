@@ -14,6 +14,8 @@ from xfuser.core.fast_attention import get_fast_attn_enable
 
 class xFuserBaseWrapper(metaclass=ABCMeta):
 
+    USE_NAIVE_FORWARD = False # why would one want to use this? It results in two independent implementation for single and multi gpu setups - strange
+
     def __init__(
         self,
         module: Any,
@@ -37,7 +39,8 @@ class xFuserBaseWrapper(metaclass=ABCMeta):
         @wraps(func)
         def check_condition_fn(self, *args, **kwargs):
             if (
-                get_pipeline_parallel_world_size() == 1
+                USE_NAIVE_FORWARD
+                and get_pipeline_parallel_world_size() == 1
                 and get_classifier_free_guidance_world_size() == 1
                 and get_sequence_parallel_world_size() == 1
                 and get_tensor_model_parallel_world_size() == 1

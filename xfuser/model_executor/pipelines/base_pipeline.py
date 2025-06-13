@@ -261,7 +261,8 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
 
     def use_naive_forward(self):
         return (
-                get_pipeline_parallel_world_size() == 1
+                xFuserBaseWrapper.USE_NAIVE_FORWARD
+                and get_pipeline_parallel_world_size() == 1
                 and get_classifier_free_guidance_world_size() == 1
                 and get_sequence_parallel_world_size() == 1
                 and get_tensor_model_parallel_world_size() == 1
@@ -369,7 +370,8 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         self, transformer: nn.Module, enable_torch_compile: bool, enable_onediff: bool, cache_args: Optional[Dict] = None,
     ):
         if (
-            get_pipeline_parallel_world_size() == 1
+            xFuserBaseWrapper.USE_NAIVE_FORWARD
+            and get_pipeline_parallel_world_size() == 1
             and get_sequence_parallel_world_size() == 1
             and get_classifier_free_guidance_world_size() == 1
             and get_tensor_model_parallel_world_size() == 1
@@ -571,6 +573,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             return get_world_group().rank == 0
         else:
             return is_dp_last_group()
+
     def gather_latents_for_vae(self, latents:torch.Tensor):
         """gather latents from dp last group
         """
