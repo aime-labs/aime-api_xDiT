@@ -397,7 +397,13 @@ def main():
     api_worker = APIWorkerInterface(
         args.api_server, WORKER_JOB_TYPE, args.api_auth_key, args.gpu_id,
         world_size=world_size, rank=local_rank,
-        gpu_name=torch.cuda.get_device_name(), worker_version=VERSION
+        gpu_name=torch.cuda.get_device_name(), worker_version=VERSION,
+        model_label="FLUX.1-Dev",
+        model_quantization="fp16",
+        model_size="12B",
+        model_family="Flux",
+        model_type="ImageGen",
+        model_repo_name="black-forest-labs/FLUX.1-dev"
     )
 
     print("Loading models... ")
