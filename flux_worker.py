@@ -118,6 +118,20 @@ class Inferencer():
         dtype: torch.dtype,
         seed: int,
     ):
+        """
+        Generate random noise tensors for image generation.
+
+        Args:
+            num_samples (int): Number of samples to generate.
+            height (int): Height of the generated noise.
+            width (int): Width of the generated noise.
+            device (torch.device): Device to place the tensor on.
+            dtype (torch.dtype): Data type of the tensor.
+            seed (int): Random seed for reproducibility.
+
+        Returns:
+            torch.Tensor: The generated noise tensor.
+        """
         return torch.randn(
             num_samples,
             16,
@@ -131,6 +145,20 @@ class Inferencer():
 
 
     def precalc_timesteps(self, latents, num_inference_steps):
+        """
+        Precalculate the timesteps for the diffusion process.
+
+        This function calculates the timesteps based on the given number of inference steps
+        and the latents tensor. It uses the scheduler's configuration to determine the appropriate
+        shift and sequence length for the timesteps.
+
+        Args:
+            latents (torch.Tensor): The latents tensor from which to calculate the image sequence length.
+            num_inference_steps (int): The number of inference steps for the diffusion process.
+
+        Returns:
+            List[int]: The calculated timesteps for the diffusion process.
+        """
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
@@ -302,6 +330,9 @@ class ProcessOutputCallback():
             finished (bool, optional): Whether the generation is finished. Defaults to True.
             error (str, optional): Error message if any. Defaults to None.
             message (str, optional): Additional message to include in the progress. Defaults to None.
+
+        Returns:
+            dict or None: Returns a dictionary with job results if finished, or None if progress is being sent.
         """
         if error:
             print('error')
