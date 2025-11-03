@@ -21,10 +21,9 @@ from xfuser.core.distributed import (
     get_pipeline_parallel_world_size,
     get_classifier_free_guidance_world_size,
     get_tensor_model_parallel_world_size,
-    get_data_parallel_world_size,
 )
 from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate_shift
-
+from xfuser.core.distributed.parallel_state import destroy_model_parallel, get_sequence_parallel_world_size
 from PIL import Image
 import numpy as np
 
@@ -108,6 +107,7 @@ class Inferencer():
         self.pipe = self.pipe.to(f"cuda:{self.local_rank}")
 
         self.pipe.prepare_run(self.input_config, steps=1)
+
 
     def gen_noise(
         self,
@@ -241,17 +241,19 @@ class Inferencer():
             latents = latents * self.pipe.vae.config.scaling_factor  
 
             vae_height = 2 * (int(height) // (self.pipe.vae_scale_factor * 2))
-            vae_width = 2 * (int(width) // (self.pipe.vae_scale_factor * 2))            
+            vae_width = 2 * (int(width) // (self.pipe.vae_scale_factor * 2))
 
-            platents = self.pipe._pack_latents(latents.bfloat16(), 1, 16, vae_height, vae_width)
-            
+            num_channels_latents = self.pipe.transformer.config.in_channels // 4
+            platents = self.pipe._pack_latents(latents.bfloat16(), 1, num_channels_latents, vae_height, vae_width)
             timesteps = self.precalc_timesteps(platents, num_steps)
-
             timestep_offset = int((1 - image2image_strength) * num_steps)
+
+            if timestep_offset > len(timesteps) - 1: # Quickfix for low values of image2image_strength
+                timestep_offset = -1
             t = timesteps[timestep_offset] * 0.001
             latents = t * noise_latents + (1.0 - t) * latents.float()
-
-            latents = self.pipe._pack_latents(latents.bfloat16(), 1, 16, vae_height, vae_width)
+            
+            latents = self.pipe._pack_latents(latents.bfloat16(), 1, num_channels_latents, vae_height, vae_width)
         else:
             generator = torch.Generator(device="cuda").manual_seed(seed)
 
@@ -295,6 +297,7 @@ class Inferencer():
             print(
                 f"epoch time: {elapsed_time:.2f} sec, peak GPU memory: {peak_memory/1e9:.2f} GB"
             )
+
 
 class ProcessOutputCallback():
     """
@@ -372,6 +375,7 @@ class ProcessOutputCallback():
                     }
                 })
 
+
 def load_flags():
     """
     Load command-line arguments using argparse.
@@ -429,6 +433,7 @@ def main():
         args.api_server, WORKER_JOB_TYPE, args.api_auth_key, args.gpu_id,
         world_size=world_size, rank=local_rank,
         gpu_name=torch.cuda.get_device_name(), worker_version=VERSION,
+        num_gpus=world_size,
         model_label="FLUX.1-Dev",
         model_quantization="fp16",
         model_size="12B",
@@ -438,103 +443,107 @@ def main():
     )
 
     print("Loading models... ")
-    inferencer = Inferencer(args.ckpt_dir, world_size)
-    inferencer.load_models()
+    try:
+        inferencer = Inferencer(args.ckpt_dir, world_size)
+        inferencer.load_models()
 
-    callback = ProcessOutputCallback(api_worker, inferencer, 'flux-dev')
+        callback = ProcessOutputCallback(api_worker, inferencer, 'flux-dev')
 
-    print("Waiting for jobs... ")
 
-    while True:
-        try:
-            callback.arrival_time = time.time()
+        while True:
+            
+            try:
+                callback.arrival_time = time.time()
+                api_worker.start_print_idle_string_thread()
+                job_data = api_worker.job_batch_request(1)
 
-            job_data = api_worker.job_batch_request(1)
+                init_image = [None]
 
-            init_image = [None]
+                if local_rank == 0:
+                    job_data = job_data[0]
+                    print(f'Processing job {job_data.get("job_id")}...', end='', flush=True)
 
-            if local_rank == 0:
-                job_data = job_data[0]
-                print(f'Processing job {job_data.get("job_id")}...', end='', flush=True)
+                    preprocessing_start = time.time()
 
-                preprocessing_start = time.time()
+                    seed = job_data.get('seed', -1)
+                    if seed == -1:
+                        random.seed(datetime.datetime.now().timestamp())
+                        seed = random.randint(1, 99999999)
+                        job_data['seed'] = seed
 
-                seed = job_data.get('seed', -1)
-                if seed == -1:
-                    random.seed(datetime.datetime.now().timestamp())
-                    seed = random.randint(1, 99999999)
-                    job_data['seed'] = seed
+                    seed = [seed]
+                    init_image_data = api_worker.get_binary(job_data, 'image')
+                    if init_image_data:
+                        init_image = [convert_binary_to_image(
+                            init_image_data,
+                            job_data.get('width'),
+                            job_data.get('height')
+                        )]
 
-                seed = [seed]
-                init_image_data = api_worker.get_binary(job_data, 'image')
-                if init_image_data:
-                    init_image = [convert_binary_to_image(
-                        init_image_data,
-                        job_data.get('width'),
-                        job_data.get('height')
-                    )]
+                    callback.job_data = job_data
 
-                callback.job_data = job_data
+                    callback.preprocessing_duration = time.time() - preprocessing_start
+                    prompt = [job_data.get('prompt')]
+                    width = [job_data.get('width')]
+                    height = [job_data.get('height')]
+                    steps = [job_data.get('steps')]
+                    guidance = [job_data.get('guidance')]
+                    progress_images = [job_data.get('provide_progress_images') == "decoded"]
+                    image2image_strength = [job_data.get('image2image_strength')]
+                else:
+                    seed = [0]
+                    callback.job_data = job_data
+                    prompt = [""]
+                    width = [1024]
+                    height = [1024]
+                    steps = [0]
+                    guidance = [1.0]
+                    progress_images = [False]
+                    image2image_strength = [0.0]
 
-                callback.preprocessing_duration = time.time() - preprocessing_start
-                prompt = [job_data.get('prompt')]
-                width = [job_data.get('width')]
-                height = [job_data.get('height')]
-                steps = [job_data.get('steps')]
-                guidance = [job_data.get('guidance')]
-                progress_images = [job_data.get('provide_progress_images') == "decoded"]
-                image2image_strength = [job_data.get('image2image_strength')]
-            else:
-                seed = [0]
-                callback.job_data = job_data
-                prompt = [""]
-                width = [1024]
-                height = [1024]
-                steps = [0]
-                guidance = [1.0]
-                progress_images = [False]
-                image2image_strength = [0.0]
+                torch.distributed.broadcast_object_list(prompt, 0)
+                torch.distributed.broadcast_object_list(seed, 0)
+                has_init_image = [init_image[0] != None]
+                torch.distributed.broadcast_object_list(has_init_image, 0)
+                if has_init_image[0]:
+                    torch.distributed.broadcast_object_list(init_image, 0)
+                torch.distributed.broadcast_object_list(width, 0)
+                torch.distributed.broadcast_object_list(height, 0)
+                torch.distributed.broadcast_object_list(steps, 0)
+                torch.distributed.broadcast_object_list(guidance, 0)
+                torch.distributed.broadcast_object_list(progress_images, 0)
+                torch.distributed.broadcast_object_list(image2image_strength, 0)
 
-            torch.distributed.broadcast_object_list(prompt, 0)
-            torch.distributed.broadcast_object_list(seed, 0)
-            has_init_image = [init_image[0] != None]
-            torch.distributed.broadcast_object_list(has_init_image, 0)
-            if has_init_image[0]:
-                torch.distributed.broadcast_object_list(init_image, 0)
-            torch.distributed.broadcast_object_list(width, 0)
-            torch.distributed.broadcast_object_list(height, 0)
-            torch.distributed.broadcast_object_list(steps, 0)
-            torch.distributed.broadcast_object_list(guidance, 0)
-            torch.distributed.broadcast_object_list(progress_images, 0)
-            torch.distributed.broadcast_object_list(image2image_strength, 0)
+                image = inferencer.gen_image(
+                    prompt[0],
+                    callback.process_output,
+                    width[0],
+                    height[0],
+                    steps[0],
+                    seed[0],
+                    guidance[0],
+                    progress_images[0],
+                    init_image[0],
+                    image2image_strength[0]
+                )
+                if local_rank == 0:
+                    print('Done')
 
-            image = inferencer.gen_image(
-                prompt[0],
-                callback.process_output,
-                width[0],
-                height[0],
-                steps[0],
-                seed[0],
-                guidance[0],
-                progress_images[0],
-                init_image[0],
-                image2image_strength[0]
-            )
-
-            print('Done')
-
-        except ValueError as exc:
-            print('Error')
-            callback.process_output(None, None, True, f'{exc}\nChange parameters and try again')
-            continue
-        except torch.cuda.OutOfMemoryError as exc:
-            print('Error - CUDA OOM')
-            callback.process_output(None, None, True, f'{exc}\nReduce image size and try again')
-            continue
-        except OSError as exc:
-            print('Error')
-            callback.process_output(None, None, True, f'{exc}\nInvalid image file')
-            continue
+            except ValueError as exc:
+                print('Error')
+                callback.process_output(None, None, True, f'{exc}\nChange parameters and try again')
+                continue
+            except torch.cuda.OutOfMemoryError as exc:
+                print('Error - CUDA OOM')
+                callback.process_output(None, None, True, f'{exc}\nReduce image size and try again')
+                continue
+            except OSError as exc:
+                print('Error')
+                callback.process_output(None, None, True, f'{exc}\nInvalid image file')
+                continue
+    except KeyboardInterrupt:
+        logging.info('KeyboardInterrupt triggered. Initiating shutdown sequence...')
+        self.api_worker.gracefully_exit()
 
     get_runtime_state().destroy_distributed_env()
 
